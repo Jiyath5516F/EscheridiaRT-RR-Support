@@ -44,6 +44,9 @@
 //     pack's raw radiance is up to 64x darker (the exposure is applied in the tonemapper).
 //   * Depth and motion can describe the surface behind a primary fog scatter without
 //     replacing the fog pixel's color guide with the surface material.
+//   * Mirror-like pixels (polished metal, still water, glass at grazing angles) can hand RR the
+//     guides, depth and motion of the surface seen in the mirror instead (primary surface
+//     replacement, RR_PSR).
 
 #ifndef __RAY_RECONSTRUCTION_HLSL__
 #define __RAY_RECONSTRUCTION_HLSL__
@@ -59,6 +62,15 @@ static const float kRRMeta = 1907.0f;    // guide atlas meta texel
 static const uint kRRAckSlot = 279;      // IncidentLight slot: RTXBoost's ack, carried to the next frame
 static const uint kRRFrameSlot = 278;    // IncidentLight slot: this frame's RR state for CopyToFinal
 static const float kRRFar = 65504.0f;    // largest fp16: "no surface" depth and hit distance
+
+// Mirror-like lobes. Below this perceptual roughness a surface shows a sharp image of what it reflects
+// or lets through, and RR only keeps that image sharp when it knows about it.
+static const float kRRMirrorRoughness = 0.1f;
+// An opaque surface counts as a mirror only where its reflection carries at least this share of its
+// albedo: metals, not polished stone with a 4 % reflection over a coloured base.
+static const float kRRMirrorMinShare = 0.5f;
+// Mirror vertices followed in a row (a mirror seen in a mirror, a pool seen in polished metal).
+static const uint kRRMaxMirrorVertices = 3u;
 
 // ---- sizes and layouts ------------------------------------------------------------------
 // DLSS (or DLAA) is the upscaler. At render size = display size only RTXBoost's ack tells
@@ -301,6 +313,11 @@ static float g_rrRoughness = 1.0f;
 static float3 g_rrDiffuseAlbedo = 0.0f;
 static float3 g_rrSpecularAlbedo = 0.0f;
 static float g_rrHitDistance = kRRFar;
+static uint g_rrHitBounce = 1u;           // path segment whose length starts the specular hit distance
+static bool g_rrHitChainOpen = false;     // the hit distance still follows mirror-like bounces
+static bool g_rrReplaced = false;         // the guides describe a surface seen in a mirror (RR_PSR)
+static float g_rrReplacedDistance = 0.0f; // path length from the mirror to that surface, as seen along the primary ray
+static float3 g_rrReplacedMotion = 0.0f;  // that surface's motion (position - previous position)
 
 // Ray generation, before RenderRay.
 void rrBeginPixel(uint2 pixel)
@@ -315,31 +332,60 @@ void rrBeginPixel(uint2 pixel)
     g_rrDiffuseAlbedo = 0.0f;
     g_rrSpecularAlbedo = 0.0f;
     g_rrHitDistance = kRRFar;
+    g_rrHitBounce = 1u;
+    g_rrHitChainOpen = false;
+    g_rrReplaced = false;
+    g_rrReplacedDistance = 0.0f;
+    g_rrReplacedMotion = 0.0f;
 #endif
 }
 
-// RenderVanilla, primary hit only. roughness is the perceptual (texture) roughness.
-void rrWritePrimarySurfaceGuide(float3 N, float3 V, float roughness, float3 albedo, float metalness, float3 F0)
-{
-#if ENABLE_RAY_RECONSTRUCTION
-    [branch] if (!g_rrActive) return;
-    g_rrSurface = true;
-    g_rrNormal = N;
-    g_rrRoughness = saturate(roughness);
-    g_rrDiffuseAlbedo = saturate(albedo * (1.0f - metalness));
-    g_rrSpecularAlbedo = saturate(rrSpecularAlbedo(F0, roughness, saturate(dot(N, V))));
-#endif
-}
-
-// RenderRay, second segment of the path (the bounce off the primary surface): how far the
-// reflected (or refracted, or diffusely bounced) ray went. RR uses it with the camera matrices to
-// move reflections with the camera. Only metals and glossy surfaces have a large specular albedo,
-// and their bounce is nearly always the specular one, so the other lobes' distances do little harm.
+// RenderRay, every segment of the path: the specular hit distance, which RR uses with the camera
+// matrices to move reflections with the camera. It is the length of the segment leaving the surface
+// the guides describe (the primary surface, or the surface seen in a mirror with RR_PSR). With
+// RR_SPEC_CHAIN_HITDIST it goes on along mirror-like bounces (see rrNoteBounceLobe): a glossy floor
+// reflecting a window shows what is behind the window, so that is where its reflection must move to.
+// Only metals and glossy surfaces have a large specular albedo, and their bounce is nearly always the
+// specular one, so the other lobes' distances do little harm.
 void rrNoteBounceDistance(int bounce, bool hitSurface, float distance)
 {
 #if ENABLE_RAY_RECONSTRUCTION
-    if (!g_rrActive || bounce != 1 || !g_rrSurface) return;
-    g_rrHitDistance = hitSurface && isfinite(distance) ? clamp(distance, 0.0f, kRRFar) : kRRFar;
+    if (!g_rrActive || !g_rrSurface) return;
+    uint segment = uint(bounce);
+    bool first = segment == g_rrHitBounce;
+    if (!first && !(g_rrHitChainOpen && segment > g_rrHitBounce)) return;
+    if (!hitSurface || !isfinite(distance))
+    {
+        g_rrHitDistance = kRRFar;
+        g_rrHitChainOpen = false;
+        return;
+    }
+    g_rrHitDistance = clamp((first ? 0.0f : g_rrHitDistance) + distance, 0.0f, kRRFar);
+    g_rrHitChainOpen = RR_SPEC_CHAIN_HITDIST && segment < g_rrHitBounce + kRRMaxMirrorVertices;
+#endif
+}
+
+// RenderRay, after each vertex: a rough lobe ends the hit distance chain there.
+void rrNoteBounceLobe(int bounce, float lobeRoughness)
+{
+#if ENABLE_RAY_RECONSTRUCTION
+    if (uint(bounce) >= g_rrHitBounce && lobeRoughness >= kRRMirrorRoughness) g_rrHitChainOpen = false;
+#endif
+}
+
+// Ray generation, after RenderRay: distance along the primary ray and motion of the point whose depth
+// and motion vector DLSS gets. On a replaced mirror pixel (RR_PSR) that is the mirror image of the
+// surface the guides describe: camera + primary direction * (distance to the mirror + path length
+// behind it). That is exact for flat mirrors and close for still water (rrMirrorLobe scales the
+// length behind a refraction), and it keeps depth, motion vectors and guides on one surface, so RR
+// moves the reflection with the reflected scene rather than with the mirror. The exposure meter keeps
+// reading the real distance (outputBufferReprojectedPathLength) to tell sky from terrain.
+void rrGuidePoint(inout float distance, inout float3 motion)
+{
+#if ENABLE_RAY_RECONSTRUCTION
+    if (!g_rrActive || !g_rrReplaced) return;
+    distance = min(distance + g_rrReplacedDistance, kRRFar);
+    motion = g_rrReplacedMotion;
 #endif
 }
 
@@ -402,6 +448,215 @@ void rrEndPixel(float3 rayOrigin, float3 rayDirection, float primaryDistance)
 
 // ---- guides that need the material code (only with Renderer.hlsl) ----------------------------
 #ifdef __RENDERER_HLSL__
+// RR divides the specular signal by this guide, so it should hold the energy the pack's specular
+// lobe really reflects. brdf.hlsl adds Kulla-Conty multiple scattering to the GGX lobe; over the
+// hemisphere that term reflects F_ms * (1 - E(NdotV)) on top of the single-scattering albedo.
+float3 rrSpecularAlbedoGuide(float3 F0, float roughness, float NdotV)
+{
+    float3 albedo = rrSpecularAlbedo(F0, roughness, NdotV);
+#if RR_SPEC_ALBEDO_MULTISCATTER
+    float directionalAlbedo = ApproxDirectionalAlbedo(NdotV, roughness);
+    float averageAlbedo = ApproxAverageAlbedo(roughness);
+    float3 averageFresnel = F0 + (1.0f - F0) / 21.0f;
+    float3 multipleScattering = averageFresnel * averageFresnel * averageAlbedo /
+        max(1.0f - averageFresnel * (1.0f - averageAlbedo), 1e-5f);
+    albedo += multipleScattering * (1.0f - directionalAlbedo);
+#endif
+    return albedo;
+}
+
+// RenderVanilla, primary hit only. roughness is the perceptual (texture) roughness.
+void rrWritePrimarySurfaceGuide(float3 N, float3 V, float roughness, float3 albedo, float metalness, float3 F0)
+{
+#if ENABLE_RAY_RECONSTRUCTION
+    [branch] if (!g_rrActive) return;
+    g_rrSurface = true;
+    g_rrNormal = N;
+    g_rrRoughness = saturate(roughness);
+    g_rrDiffuseAlbedo = saturate(albedo * (1.0f - metalness));
+    g_rrSpecularAlbedo = saturate(rrSpecularAlbedoGuide(F0, roughness, saturate(dot(N, V))));
+#endif
+}
+
+// ---- primary surface replacement (RR_PSR) ----
+// A mirror pixel shows another surface, scaled by the mirror's colour. With the mirror's own guides
+// (flat normal, plain albedo) RR cannot tell the texture and edges of the reflected scene from noise
+// and smears them. So the pixel gets the guides of the first rough surface along the mirror's
+// dominant lobe, with the mirror's colour folded into the albedos (RR's demodulation then still
+// matches the pixel's energy), and depth and motion of its mirror image (rrGuidePoint).
+
+struct RRMirrorLobe
+{
+    float3 direction;  // mean direction of the lobe
+    float3 weight;     // share of the light the lobe carries
+    float lengthScale; // path length behind the vertex -> apparent distance along the incoming ray
+    bool reflected;
+    bool crossesWater;
+};
+
+// Relative index of refraction across water or glass, as RenderVanilla uses it.
+float rrInterfaceEta(bool isWater, bool frontFacing, bool inWater, float waterIOR)
+{
+    return isWater ? (inWater ? waterIOR : 1.0f / waterIOR) : (frontFacing ? 1.0f / 1.5f : 1.5f);
+}
+
+// The dominant lobe of a surface, if it is a mirror-like one: a reflection, or the refraction into
+// still water. False for rough surfaces and where the surface's diffuse colour outweighs the mirror
+// lobe. Mean directions only, so guides built from it do not flicker.
+bool rrMirrorLobe(uint materialType, SurfaceInfo surface, float3 N, float3 V, float eta, out RRMirrorLobe lobe)
+{
+    lobe.direction = reflect(-V, N);
+    lobe.weight = 0.0f;
+    lobe.lengthScale = 1.0f;
+    lobe.reflected = true;
+    lobe.crossesWater = false;
+    if (surface.roughness >= kRRMirrorRoughness) return false;
+
+    float NdotV = saturate(dot(N, V));
+    bool isWater = materialType == MATERIAL_TYPE_WATER;
+    bool isClear = isWater || (materialType == MATERIAL_TYPE_ALPHA_BLEND && surface.alpha < 0.9999f);
+    if (!isClear)
+    {
+        float3 specular = rrSpecularAlbedoGuide(surface.F0, surface.roughness, NdotV);
+        float3 diffuse = surface.color * (1.0f - surface.metalness);
+        lobe.weight = specular;
+        return luminance(specular) >= kRRMirrorMinShare * luminance(specular + diffuse);
+    }
+
+    // Water and glass split the light three ways, as RenderVanilla does: reflection F, transmission
+    // (1 - F)(1 - opacity) and the surface's own diffuse colour (1 - F) opacity. The largest share wins.
+    float cosThetaT;
+    float F = DielectricFresnel(NdotV, eta, cosThetaT);
+    float opacity = saturate(surface.alpha);
+    float transmitted = (1.0f - F) * (1.0f - opacity);
+    float diffuse = (1.0f - F) * opacity;
+    if (F >= transmitted && F >= diffuse)
+    {
+        lobe.weight = F;
+        return true;
+    }
+    // Looking through glass stays with RR_TRANSPARENT_GUIDES: a pane's own reflection moves with the
+    // pane, and with depth and motion of the scene behind it RR would drag that reflection along with
+    // the scene and smear the glass whenever the camera moves.
+    if (diffuse >= transmitted || !isWater) return false;
+    // Water is one interface: the ray bends and the radiance scales by eta^2, as in the renderer. Seen
+    // through a flat surface, a point at path length s behind it lies on the incoming ray at s * eta.
+    lobe.reflected = false;
+    lobe.direction = refract(-V, N, eta);
+    lobe.weight = transmitted * eta * eta;
+    lobe.lengthScale = eta;
+    lobe.crossesWater = true;
+    return dot(lobe.direction, lobe.direction) > 1e-6f;
+}
+
+// A surface hit by the guide chain, with its normals facing the incoming ray as in RenderVanilla.
+struct RRChainHit
+{
+    uint materialType;
+    SurfaceInfo surface;
+    float3 ng;
+    float3 N;
+    float eta;
+};
+
+RRChainHit rrLoadChainHit(HitInfo hit, float3 direction, bool inWater)
+{
+    RRChainHit h;
+    ObjectInstance object = objectInstances[hit.objectInstanceIndex];
+    GeometryInfo geometry = GetGeometryInfo(hit, object);
+    h.surface = MaterialVanilla(hit, geometry, object);
+    float waterIOR = 1.333f;
+    if (hit.materialType == MATERIAL_TYPE_WATER)
+    {
+        WaterMaterial water;
+        float parallaxHeight;
+        water.SetUp(h.surface, geometry, direction, 1, parallaxHeight);
+        waterIOR = water.IOR.x;
+    }
+    if (hit.materialType == MATERIAL_TYPE_OPAQUE || hit.materialType == MATERIAL_TYPE_ALPHA_TEST) h.surface.alpha = 1.0f;
+    h.materialType = hit.materialType;
+    float3 V = -direction;
+    h.ng = dot(geometry.geometryNormal, V) < 0.0f ? -geometry.geometryNormal : geometry.geometryNormal;
+    h.N = FixShadingNormal(h.ng, dot(h.surface.normal, V) < 0.0f ? -h.surface.normal : h.surface.normal);
+    h.eta = rrInterfaceEta(hit.materialType == MATERIAL_TYPE_WATER, hit.frontFacing, inWater, waterIOR);
+    return h;
+}
+
+// Reflection about the plane with normal n: maps directions behind a mirror into the mirror image.
+float3x3 rrMirrorMatrix(float3 n)
+{
+    return float3x3(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f) - 2.0f * float3x3(n.x * n, n.y * n, n.z * n);
+}
+
+// RenderVanilla, primary hit: if the surface is mirror-like, follows its dominant lobe up to the
+// first rough surface and gives the pixel that surface's guides. Normals are mirrored back through
+// every reflection so they belong to the mirror image that depth and motion describe. A chain that
+// ends in the sky gets RR's sky convention.
+void rrReplacePrimarySurface(uint materialType, SurfaceInfo surface, float3 ng, float3 N, float3 V, float eta, bool inWater)
+{
+#if ENABLE_RAY_RECONSTRUCTION && RR_PSR
+    [branch] if (!g_rrActive) return;
+    RRMirrorLobe lobe;
+    if (!rrMirrorLobe(materialType, surface, N, V, eta, lobe)) return;
+
+    float3 throughput = 1.0f;
+    float3x3 mirror = float3x3(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+    float apparentLength = 0.0f;
+    float lengthScale = 1.0f;
+    float3 position = surface.position;
+    for (uint vertex = 1u; vertex <= kRRMaxMirrorVertices; ++vertex)
+    {
+        throughput *= lobe.weight;
+        if (lobe.reflected) mirror = mul(mirror, rrMirrorMatrix(N));
+        if (lobe.crossesWater) inWater = !inWater;
+        lengthScale *= lobe.lengthScale;
+
+        RayDesc ray;
+        ray.Direction = normalize(lobe.direction);
+        ray.Origin = offset_ray(position, lobe.reflected ? ng : -ng);
+        ray.TMin = 0.0f;
+        ray.TMax = 10000.0f;
+        RayQuery<RAY_FLAG_NONE> q;
+        q.TraceRayInline(SceneBVH, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xff & ~INSTANCE_MASK_SUN_OR_MOON, ray);
+        while (q.Proceed())
+        {
+            if (AlphaTestHitLogic(GetCandidateHitInfo(q)))
+                q.CommitNonOpaqueTriangleHit();
+        }
+        g_rrReplaced = true;
+        g_rrHitBounce = 1u + vertex;
+        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        {
+            g_rrSurface = false;
+            g_rrReplacedDistance = kRRFar;
+            g_rrReplacedMotion = 0.0f;
+            return;
+        }
+        HitInfo hit = GetCommittedHitInfo(q);
+        apparentLength += hit.rayT * lengthScale;
+        RRChainHit h = rrLoadChainHit(hit, ray.Direction, inWater);
+        if (vertex < kRRMaxMirrorVertices && rrMirrorLobe(h.materialType, h.surface, h.N, -ray.Direction, h.eta, lobe))
+        {
+            position = h.surface.position;
+            ng = h.ng;
+            N = h.N;
+            continue;
+        }
+
+        float NdotV = saturate(dot(h.N, -ray.Direction));
+        g_rrSurface = true;
+        g_rrNormal = mul(mirror, h.N);
+        g_rrRoughness = saturate(h.surface.roughness);
+        g_rrDiffuseAlbedo = saturate(throughput * h.surface.color * (1.0f - h.surface.metalness));
+        g_rrSpecularAlbedo = saturate(throughput * rrSpecularAlbedoGuide(h.surface.F0, h.surface.roughness, NdotV));
+        g_rrReplacedDistance = apparentLength;
+        // The mirror image moves like the surface, mirrored through every reflection on the way.
+        g_rrReplacedMotion = mul(mirror, h.surface.position - h.surface.prevPosition);
+        return;
+    }
+#endif
+}
+
 // Describe background geometry without changing the guide for fog radiance.
 void rrDescribeFoggedPrimarySurface(HitInfo hitInfo, float3 rayDirection, inout float primaryDistance, inout float3 primaryMotion)
 {
@@ -430,7 +685,7 @@ void rrWriteTransparentPrimaryGuide(float3 position, float3 ng, float3 N, float3
     float3 surfaceColor, float opacity, float eta, bool isWater)
 {
 #if ENABLE_RAY_RECONSTRUCTION
-    [branch] if (!g_rrActive) return;
+    [branch] if (!g_rrActive || g_rrReplaced) return;
     float cosThetaT;
     float F = DielectricFresnel(saturate(dot(V, N)), eta, cosThetaT);
     float3 tint = isWater ? 1.0f : GetAlphaBlendTransmissionTint(surfaceColor);

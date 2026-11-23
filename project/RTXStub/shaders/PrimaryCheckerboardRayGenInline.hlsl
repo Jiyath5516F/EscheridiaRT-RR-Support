@@ -78,7 +78,11 @@ void PrimaryCheckerboardRayGenInline(
     
     
         
-motionVector  = computeMotionVector(rayDesc.Origin + rayDesc.Direction * hitDist, objMotion);
+    // DLSS Ray Reconstruction: depth and motion of the surface the guides describe (RayReconstruction.hlsl)
+    float guideDist = hitDist;
+    float3 guideMotion = objMotion;
+    rrGuidePoint(guideDist, guideMotion);
+motionVector  = computeMotionVector(rayDesc.Origin + rayDesc.Direction * guideDist, guideMotion);
    
 
     // Basic debug views for NaNs and Infinity
@@ -98,5 +102,5 @@ motionVector  = computeMotionVector(rayDesc.Origin + rayDesc.Direction * hitDist
     outputBufferMotionVectors[dispatchThreadID.xy] = motionVector;
     outputBufferReprojectedPathLength[dispatchThreadID.xy] = hitDist;
 
-    rrEndPixel(rayDesc.Origin, rayDesc.Direction, hitDist); // DLSS Ray Reconstruction guides (RayReconstruction.hlsl)
+    rrEndPixel(rayDesc.Origin, rayDesc.Direction, guideDist); // DLSS Ray Reconstruction guides (RayReconstruction.hlsl)
 }

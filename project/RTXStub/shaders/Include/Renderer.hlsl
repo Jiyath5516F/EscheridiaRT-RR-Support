@@ -385,6 +385,8 @@
             float alphaBlendOpacity = (surfaceInfo.alpha);
             bool isFullyOpaqueAlphaBlend = hitInfo.materialType == MATERIAL_TYPE_ALPHA_BLEND && surfaceInfo.alpha >= 0.9999f;
             bool isTransparentSurface = hitInfo.materialType == MATERIAL_TYPE_WATER || (hitInfo.materialType == MATERIAL_TYPE_ALPHA_BLEND && !isFullyOpaqueAlphaBlend);
+            // DLSS Ray Reconstruction: a polished metal's guides describe what it reflects (RayReconstruction.hlsl)
+            if (bounceCount == 0 && !isTransparentSurface) rrReplacePrimarySurface(hitInfo.materialType, surfaceInfo, ng, N, V, 1.0f, inWater);
             
             bool rayRefractedGoesInside = false;
 
@@ -408,6 +410,8 @@
                 float eta = isWater
                     ? (inWater ? waterIOR : 1.0f / waterIOR)
                     : (hitInfo.frontFacing ? (1.0f / 1.5f) : 1.5f);
+                // DLSS Ray Reconstruction: still water and clear glass describe what they reflect or let through (RayReconstruction.hlsl)
+                if (bounceCount == 0) rrReplacePrimarySurface(hitInfo.materialType, surfaceInfo, ng, N, V, eta, inWater);
                 #if RR_TRANSPARENT_GUIDES
                 // DLSS Ray Reconstruction: guides for what the pixel shows through the surface (RayReconstruction.hlsl)
                 if (bounceCount == 0) rrWriteTransparentPrimaryGuide(surfaceInfo.position, ng, N, V, surfaceInfo.roughness, surfaceInfo.color, surfaceInfo.alpha, eta, isWater);
@@ -1023,6 +1027,8 @@
             }
             
             
+            rrNoteBounceLobe(i, rayState.lobeRoughness); // DLSS Ray Reconstruction: specular hit distance (RayReconstruction.hlsl)
+
             if (i > 1)
             {
                 float p = max(max(rayState.throughput.x, rayState.throughput.y), rayState.throughput.z);

@@ -83,6 +83,18 @@ Other switches in `settings.HLSL`:
 - `RR_FOG_BACKGROUND_MOTION` supplies background surface depth and motion for primary fog-scattered
   pixels in RR mode without writing the background material guide. Set it to 0 to use the previous
   far-depth and sky-motion behavior.
+- `RR_PSR` (primary surface replacement): on polished metal, still water and glass seen at a
+  grazing angle (roughness below 0.1) the guides describe the first rough surface seen in the
+  reflection or under the water, with the mirror's colour folded into the albedo guides, and depth
+  and motion describe its mirror image. RR then keeps that image sharp instead of smearing it as
+  light on a flat surface. Up to three extra rays per such pixel, only in RR mode. Looking through
+  glass keeps `RR_TRANSPARENT_GUIDES` (with the scene behind a pane in depth and motion, RR dragged
+  the pane's own reflection along and the glass smeared while moving). Off by default: sharper
+  still images, but more noise right after camera moves. 0 = the mirror's own guides.
+- `RR_SPEC_CHAIN_HITDIST`: the specular hit distance of glossy surfaces follows mirror-like bounces
+  up to the first rough surface instead of ending after the first bounce. 0 = first bounce only.
+- `RR_SPEC_ALBEDO_MULTISCATTER`: the specular albedo guide includes the multiple-scattering energy
+  `brdf.hlsl` adds to rough specular (Kulla-Conty). 0 = single scattering only.
 
 ## Files
 
@@ -91,9 +103,11 @@ Other switches in `settings.HLSL`:
 - `project/RTXStub/shaders/Include/Generated/Signature.hlsl`: `rrGuideAtlas` at u8
 - `project/RTXStub/shaders/Include/settings.HLSL`: the switches above
 - `project/RTXStub/shaders/PrimaryCheckerboardRayGenInline.hlsl`: `rrBeginPixel` before and
-  `rrEndPixel` (writes the guides) after `RenderRay`
-- `project/RTXStub/shaders/Include/Renderer.hlsl`: primary surface guide and water / glass guide
-  in `RenderVanilla`, bounce distance and the surface behind fog in `RenderRay`
+  `rrEndPixel` (writes the guides) after `RenderRay`; `rrGuidePoint` moves depth and motion vector
+  to the mirror image on replaced pixels
+- `project/RTXStub/shaders/Include/Renderer.hlsl`: primary surface guide, primary surface
+  replacement and water / glass guide in `RenderVanilla`, bounce distances and lobes and the surface
+  behind fog in `RenderRay`
 - `project/RTXStub/shaders/FinalCombine.hlsl`: marker, keeps packed guides, pre-exposes the RR input
 - `project/RTXStub/shaders/CopyToFinal.hlsl`: carries the ack, removes the pre-exposure
 

@@ -298,6 +298,19 @@ static const bool useFastBRDFApprox =  USE_ACCURATE_DIFFUSE_BRDF;
 // Use background surface depth and motion for primary fog-scattered rays in RR mode.
 #define RR_FOG_BACKGROUND_MOTION 1
 
+// Polished metal, still water and glass at grazing angles in RR mode: the guides describe the first
+// rough surface seen in the reflection or under the water, so RR keeps that image sharp (up to three
+// extra rays per mirror-like pixel). 0 = guides of the mirror surface itself.
+#define RR_PSR 0
+
+// Glossy surfaces in RR mode: the specular hit distance follows mirror-like bounces up to the first
+// rough surface instead of ending after the first bounce.
+#define RR_SPEC_CHAIN_HITDIST 1
+
+// RR's specular albedo guide includes the multiple-scattering energy brdf.hlsl adds to rough specular.
+// 0 = single scattering only.
+#define RR_SPEC_ALBEDO_MULTISCATTER 1
+
 // Reduce primary air-fog direct-light noise in RR mode at the cost of an extra shadow ray.
 #define RR_FOG_DIRECT_SAMPLING 1
 
