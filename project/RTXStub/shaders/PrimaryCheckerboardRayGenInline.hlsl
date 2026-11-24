@@ -64,6 +64,7 @@ void PrimaryCheckerboardRayGenInline(
      float3 directColor; float3 primaryThroughput;
      rrBeginPixel(dispatchThreadID.xy); // DLSS Ray Reconstruction guides (RayReconstruction.hlsl)
      color = RenderRay(rayDesc, hitDist, objMotion, dispatchThreadID.xy, firstHitDist);
+     rrFinishDiffuseHitDistance(dispatchThreadID.xy); // DLSS Ray Reconstruction: diffuse hit distance (RayReconstruction.hlsl)
 
      float4 blueNoise = GetBlueNoiseValue(dispatchThreadID.xy);
       float3 sunDir =  getDirectionToSun();

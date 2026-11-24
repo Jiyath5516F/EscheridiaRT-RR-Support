@@ -50,16 +50,19 @@ Version 3 guide texture (`rrGuideAtlas`, RGBA16F, 2 x render width by 2 x render
 | (x, y) | world normal, roughness |
 | (render width + x, y) | diffuse albedo, linear view depth |
 | (x, render height + y) | specular albedo |
-| (render width + x, render height + y) | specular hit distance, specular motion vector |
+| (render width + x, render height + y) | specular hit distance, specular motion vector, diffuse hit distance (`RR_DIFFUSE_HITDIST`, else 0) |
 | (0, 2 x render height) | stamp: 1907, frame number, render size (so RTXBoost knows the pack writes it) |
+| (1, 2 x render height) | features: 1913, feature bits (1 = diffuse hit distance), frame number |
 
 The pack only touches u8 after RTXBoost acked version 3. Without RTXBoost the register is
 not bound at all, so it must never be read or written in other frames.
 
 With version 3, RTXBoost also gives RR the pack's linear depth, the specular hit distance with the
-game's camera matrices, and resets RR's history on camera cuts (/tp, very fast flight): it reads
-`steveSpaceDelta` from the view constants of the ray tracing passes. That reset only works with
-version 3 (RTXBoost follows the view constants only while its guide texture is bound).
+game's camera matrices, the diffuse hit distance when the feature texel says it is there (it only
+trusts the texel while it carries the same frame number as the stamp), and resets RR's history on
+camera cuts (/tp, respawn; steady flight never counts as one): it reads `steveSpaceDelta` from the
+view constants of the ray tracing passes. That reset only works with version 3 (RTXBoost follows
+the view constants only while its guide texture is bound).
 
 ## Requirements
 
@@ -86,15 +89,29 @@ Other switches in `settings.HLSL`:
 - `RR_PSR` (primary surface replacement): on polished metal, still water and glass seen at a
   grazing angle (roughness below 0.1) the guides describe the first rough surface seen in the
   reflection or under the water, with the mirror's colour folded into the albedo guides, and depth
-  and motion describe its mirror image. RR then keeps that image sharp instead of smearing it as
-  light on a flat surface. Up to three extra rays per such pixel, only in RR mode. Looking through
-  glass keeps `RR_TRANSPARENT_GUIDES` (with the scene behind a pane in depth and motion, RR dragged
-  the pane's own reflection along and the glass smeared while moving). Off by default: sharper
-  still images, but more noise right after camera moves. 0 = the mirror's own guides.
+  and motion describe its mirror image. The mirror's other lobes are added to the albedo guides where
+  their albedo is known (a water surface's own reflection and colour, a metal's leftover diffuse
+  colour): the path still samples them, and without them RR took that light for noise. RR then keeps
+  the mirrored image sharp instead of smearing it as light on a flat surface. Up to three extra rays
+  per such pixel, only in RR mode, about 3-4 % FPS (RTX 3050). Looking through glass keeps
+  `RR_TRANSPARENT_GUIDES` (with the scene behind a pane in depth and motion, RR dragged the pane's
+  own reflection along and the glass smeared while moving). On by default since 2026-11-23: in
+  repeated tests it is as noisy as without it, still and after camera moves. 0 = the mirror's own
+  guides.
 - `RR_SPEC_CHAIN_HITDIST`: the specular hit distance of glossy surfaces follows mirror-like bounces
   up to the first rough surface instead of ending after the first bounce. 0 = first bounce only.
 - `RR_SPEC_ALBEDO_MULTISCATTER`: the specular albedo guide includes the multiple-scattering energy
   `brdf.hlsl` adds to rough specular (Kulla-Conty). 0 = single scattering only.
+- `RR_DIFFUSE_HITDIST`: the guides also carry the diffuse hit distance, the length of the diffuse
+  bounce off the surface whose diffuse albedo the guides describe (the primary surface, the surface
+  seen in a mirror with `RR_PSR`, or the solid surface behind water and glass). It is meant to keep
+  contact shadows and corners, where the diffuse light comes from close by, out of RR's wide blur.
+  The renderer picks one lobe per path, so where the path did not bounce diffusely off that surface
+  this frame, one probe ray with the same cosine distribution measures the distance (only the hit,
+  no shading; skipped where the diffuse albedo is zero). RTXBoost versions older than 1.5.0 ignore
+  it. Off by default: it costs 3-7 % FPS (RTX 3050) and the RR model of the 2026-11 NVIDIA driver
+  showed no change at all, not even with the distance forced to 0 or to "far" for every pixel.
+  0 = specular hit distance only.
 
 ## Files
 
@@ -103,8 +120,8 @@ Other switches in `settings.HLSL`:
 - `project/RTXStub/shaders/Include/Generated/Signature.hlsl`: `rrGuideAtlas` at u8
 - `project/RTXStub/shaders/Include/settings.HLSL`: the switches above
 - `project/RTXStub/shaders/PrimaryCheckerboardRayGenInline.hlsl`: `rrBeginPixel` before and
-  `rrEndPixel` (writes the guides) after `RenderRay`; `rrGuidePoint` moves depth and motion vector
-  to the mirror image on replaced pixels
+  `rrFinishDiffuseHitDistance` (the probe ray) and `rrEndPixel` (writes the guides) after
+  `RenderRay`; `rrGuidePoint` moves depth and motion vector to the mirror image on replaced pixels
 - `project/RTXStub/shaders/Include/Renderer.hlsl`: primary surface guide, primary surface
   replacement and water / glass guide in `RenderVanilla`, bounce distances and lobes and the surface
   behind fog in `RenderRay`

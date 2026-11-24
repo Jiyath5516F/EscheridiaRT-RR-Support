@@ -335,7 +335,7 @@
             bool isWater = hitInfo.materialType == MATERIAL_TYPE_WATER; 
             float3 F0 = surfaceInfo.F0; 
             // DLSS Ray Reconstruction guides of the primary surface (RayReconstruction.hlsl)
-            if (bounceCount == 0) rrWritePrimarySurfaceGuide(N, V, surfaceInfo.roughness, surfaceInfo.color, surfaceInfo.metalness, F0);
+            if (bounceCount == 0) rrWritePrimarySurfaceGuide(surfaceInfo.position, ng, N, V, surfaceInfo.roughness, surfaceInfo.color, surfaceInfo.metalness, F0);
             
             /*
             #if DO_RAIN_WETNESS
@@ -670,7 +670,7 @@
                 HitInfo hitInfo = GetCommittedHitInfo(q);
                 surface = hitInfo.rayT;
             }
-            rrNoteBounceDistance(i, hitSurface, surface); // DLSS Ray Reconstruction: specular hit distance (RayReconstruction.hlsl)
+            rrNoteBounceDistance(i, hitSurface, surface); // DLSS Ray Reconstruction: hit distances (RayReconstruction.hlsl)
 
             if (rayState.inSSSMedium)
             {
@@ -1027,7 +1027,7 @@
             }
             
             
-            rrNoteBounceLobe(i, rayState.lobeRoughness); // DLSS Ray Reconstruction: specular hit distance (RayReconstruction.hlsl)
+            rrNoteBounceLobe(i, rayState.lobeRoughness, rayState.rayDesc.Origin, rayState.inSSSMedium); // DLSS Ray Reconstruction: hit distances (RayReconstruction.hlsl)
 
             if (i > 1)
             {

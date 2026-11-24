@@ -300,8 +300,9 @@ static const bool useFastBRDFApprox =  USE_ACCURATE_DIFFUSE_BRDF;
 
 // Polished metal, still water and glass at grazing angles in RR mode: the guides describe the first
 // rough surface seen in the reflection or under the water, so RR keeps that image sharp (up to three
-// extra rays per mirror-like pixel). 0 = guides of the mirror surface itself.
-#define RR_PSR 0
+// extra rays per mirror-like pixel, about 3-4 % FPS on an RTX 3050).
+// 0 = guides of the mirror surface itself.
+#define RR_PSR 1
 
 // Glossy surfaces in RR mode: the specular hit distance follows mirror-like bounces up to the first
 // rough surface instead of ending after the first bounce.
@@ -310,6 +311,14 @@ static const bool useFastBRDFApprox =  USE_ACCURATE_DIFFUSE_BRDF;
 // RR's specular albedo guide includes the multiple-scattering energy brdf.hlsl adds to rough specular.
 // 0 = single scattering only.
 #define RR_SPEC_ALBEDO_MULTISCATTER 1
+
+// RR mode: the guides also carry the diffuse hit distance (how far the diffuse bounce off the
+// surface travelled), meant to help RR keep contact shadows and corners. Costs one probe ray on pixels
+// whose path did not bounce diffusely this frame (3-7 % FPS on an RTX 3050). Off by default: with the
+// 2026-11 driver's RR model the picture did not change at all, not even with the distance forced to 0
+// or to "far" everywhere. Needs RTXBoost 1.5.0 or newer; older versions ignore it.
+// 0 = specular hit distance only.
+#define RR_DIFFUSE_HITDIST 0
 
 // Reduce primary air-fog direct-light noise in RR mode at the cost of an extra shadow ray.
 #define RR_FOG_DIRECT_SAMPLING 1
